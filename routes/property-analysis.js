@@ -7,32 +7,20 @@ import pool from '../db.js'; // Assuming db.js is needed for potential future fe
 import fetch from 'node-fetch'; // Make sure node-fetch is installed (`npm install node-fetch` in ss-api dir)
 // Assuming auth middleware is imported and used in app.js for this router
 
+// --- Import utility/calculation functions ---
+// Corrected path assumes analysisCalculations.js is in ss-api/utils
+import { calculateRevenues } from '../utils/analysisCalculations.js';
+// Note: sendAlertToN8n, vary, coordsAreTooClose could be moved to a separate helpers file later.
+// For now, they remain here as they were in the original code before this refactoring phase.
+
+
+// --- Initialize Express Router ---
+// This MUST be declared AFTER the express import and BEFORE any routes are defined using 'router.post', etc.
 const router = express.Router();
+// --- End Initialize ---
+
 
 // --- Utility functions ---
-
-// vary: Applies a small random percentage variation (currently not used in the main analysis logic, but kept as it was in source)
-const vary = (value, maxPercent = 1.5) => {
-    const percent = (Math.random() * maxPercent * 10) / 1000; // Generates a value between 0 and maxPercent/100
-    const direction = Math.random() > 0.5 ? 1 : -1; // Randomly choose positive or negative direction
-    // Apply variation only if value is a number and not zero
-    if (typeof value !== 'number' || value === 0) return value;
-    return value + (value * percent * direction);
-};
-
-// coordsAreTooClose: Calculates distance between two sets of coordinates (currently not used in analysis logic, kept for source fidelity)
-const coordsAreTooClose = (lat1, lng1, lat2, lng2, thresholdMeters = 50) => {
-    const earthRadius = 6371000; // in meters
-    const latDelta = (lat2 - lat1) * Math.PI / 180;
-    const lngDelta = (lng2 - lng1) * Math.PI / 180;
-    const a = Math.sin(latDelta / 2) ** 2 +
-              Math.cos(lat1 * Math.PI / 180) *
-              Math.cos(lat2 * Math.PI / 180) *
-              Math.sin(lngDelta / 2) ** 2;
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return (earthRadius * c) <= thresholdMeters;
-};
-
 // sendAlertToN8n: Sends a POST request to an N8N webhook for alerts.
 const sendAlertToN8n = async (payload) => {
     try {
@@ -54,103 +42,238 @@ const sendAlertToN8n = async (payload) => {
     }
 };
 
+// --- Utility functions (currently unused in core logic but kept for source fidelity) ---
+const vary = (value, maxPercent = 1.5) => {
+    if (typeof value !== 'number' || value === 0) return value;
+    const percent = (Math.random() * maxPercent * 10) / 1000;
+    const direction = Math.random() > 0.5 ? 1 : -1;
+    return value + (value * percent * direction);
+};
+
+const coordsAreTooClose = (lat1, lng1, lat2, lng2, thresholdMeters = 50) => {
+    const earthRadius = 6371000;
+    const latDelta = (lat2 - lat1) * Math.PI / 180;
+    const lngDelta = (lng2 - lng1) * Math.PI / 180;
+    const a = Math.sin(latDelta / 2) ** 2 +
+              Math.cos(lat1 * Math.PI / 180) *
+              Math.cos(lat2 * Math.PI / 180) *
+              Math.sin(lngDelta / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return (earthRadius * c) <= thresholdMeters;
+};
+// --- End Utility functions ---
+
 
 // --- Main Analysis Endpoint ---
 // This route handles POST requests to /analyze (which is mounted at /api/v1/property in app.js)
 // Assumes authentication middleware has already run and validated the API key.
 router.post('/analyze', async (req, res) => {
     // Extract input data from the request body (sent as JSON from PHP)
-    const { address, bedrooms, bathrooms, occupancy } = req.body;
+    const { address, bedrooms, bathrooms, occupancy, referrer, utm_source, agent_id } = req.body;
 
     // --- Input Validation ---
     // Basic validation for required fields
     if (!address) {
-        console.warn('Analysis request missing address:', req.body); // Keep this warning
+        console.warn('Analysis request missing address:', req.body);
         // Always send 200 to PHP proxy, use success: false to indicate a user input error
+        // Note: We return here, so initial query log and error log won't happen for missing address.
+        // If you needed to log this validation failure, move the initial log outside this check.
         return res.status(200).json({
             success: false,
-            message: 'Property address is required for analysis.' // User-friendly message for the frontend
+            message: 'Property address is required for analysis.'
         });
     }
 
-    console.log('Received analysis request for address:', address); // Keep this log, helpful for tracking requests by address
+    console.log('Received analysis request for address:', address);
 
+    // --- Start: Log initial query ---
+    // Log the query request *before* the main try block to capture it even if analysis fails later.
+    let queryId = null; // Variable to hold the ID of the inserted row
     try {
-        // --- Prepare & Call External API (AirDNA via RapidAPI) ---
-
-        // Calculate accommodates/occupancy if not explicitly provided
-        const beds = parseInt(bedrooms, 10) || 0;
-        const calculatedOccupancy = (!occupancy && beds > 0) ? beds * 2 : (parseInt(occupancy, 10) || 0);
-
-        // Prepare parameters for the AirDNA API request URL (expects query parameters for rentalizer endpoint)
-        const params = new URLSearchParams({
-            address: address,
-            ...(beds > 0 && { bedrooms: beds }), // Only add if beds > 0
-            ...(parseFloat(bathrooms) > 0 && { bathrooms: parseFloat(bathrooms) }), // Only add if bathrooms > 0
-            ...(calculatedOccupancy > 0 && { accommodates: calculatedOccupancy }) // Only add if calculated occupancy > 0
+        const result = await pool.query(
+            `INSERT INTO analyzer_queries (address, referrer, utm_source, agent_id, query_success)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id`,
+            [address, referrer, utm_source, agent_id, false] // Initially assume failure, update later
+        );
+        queryId = result.rows[0].id; // Get the ID of the newly inserted row
+        // console.log(`📊 Logged initial query for address ${address} with ID: ${queryId}`); // Optional log
+    } catch (logError) {
+        // Log the database error but do NOT stop the main analysis flow
+        console.error('🚫 Failed to log initial query to database:', logError); // Keep this error log
+        // Attempt to send alert for database logging failure
+        await sendAlertToN8n({
+            subject: '⚠️ StaySTRA Analyzer DB Logging Error',
+            body: `Failed to log initial query to analyzer_queries table for address: ${address || 'N/A'}\n` +
+                  `• Error: ${logError.message}\n` +
+                  `• Time: ${new Date().toISOString()}`
         });
+        // queryId remains null, which is okay - we just won't be able to update this log later or link errors
+    }
+    // --- End: Log initial query ---
 
-        // Construct the full AirDNA API URL
-        const airdnaApiUrl = `${process.env.AIRDNA_BASE_URL || 'https://airdna1.p.rapidapi.com/rentalizer'}?${params}`;
-        // console.log('🌐 Calling AirDNA API:', airdnaApiUrl); // Removed noisy log
 
-        // Make the request to the AirDNA RapidAPI endpoint
-        const airdnaResponse = await fetch(airdnaApiUrl, {
-            method: 'GET', // Based on typical RapidAPI usage for rentalizer endpoint
-            headers: {
-                'x-rapidapi-host': 'airdna1.p.rapidapi.com',
-                'x-rapidapi-key': process.env.RAPIDAPI_KEY, // Use the key from .env
-                'User-Agent': 'StaySTRAAnalyzer/0.3' // Custom User-Agent
+    // --- Main Processing Logic ---
+    let rawAirDnaResponse = null; // Variable to hold the data, whether from cache or API
+    let source = 'unknown'; // Track source for potential logging/debugging
+
+    try { // This main try block wraps all core logic and catches generic internal errors
+        const cacheExpirationDays = 30; // Define how old a cache entry can be
+
+        // --- Start: Check Cache ---
+        console.log(`🔍 Checking cache for address ${address}.`); // Keep this log
+        try { // Inner try/catch for cache specific errors
+            const cacheResult = await pool.query(
+                `SELECT raw_api_response, last_fetched
+                 FROM property_cache
+                 WHERE address = $1
+                 AND last_fetched >= NOW() - INTERVAL '${cacheExpirationDays} days'`, // Check expiration
+                [address]
+            );
+
+            if (cacheResult.rows.length > 0) {
+                rawAirDnaResponse = cacheResult.rows[0].raw_api_response;
+                source = 'cache';
+                console.log(`✅ Cache hit for address ${address}. Last fetched: ${cacheResult.rows[0].last_fetched}`); // Keep this log
+            } else {
+                console.log(`🔍 No valid cache entry found for address ${address}.`); // Keep this log
             }
-        });
 
-        // Check if the AirDNA API call itself was successful (HTTP status 2xx)
-        if (!airdnaResponse.ok) {
-            const errorBody = await airdnaResponse.text(); // Get raw error body
-            console.error(`AirDNA RapidAPI call failed: Status ${airdnaResponse.status} - ${airdnaResponse.statusText}`, errorBody); // Keep error log
-
-            // Attempt to send alert for external API failure
+        } catch (cacheError) {
+            console.error('🚫 Failed during cache check:', cacheError);
             await sendAlertToN8n({
-                subject: '🚨 StaySTRA Analyzer External API Error',
-                body: `AirDNA RapidAPI call failed for address: ${address}\n` +
-                      `• Status: ${airdnaResponse.status} - ${airdnaResponse.statusText}\n` +
-                      `• Response Body: ${errorBody.substring(0, 500)}...\n` + // Limit body length
+                subject: '⚠️ StaySTRA Analyzer Cache Check Error',
+                body: `Failed to check property_cache table for address: ${address || 'N/A'}\n` +
+                      `• Error: ${cacheError.message}\n` +
                       `• Time: ${new Date().toISOString()}`
             });
+            // Continue execution (rawAirDnaResponse remains null) -> will trigger API call
+        }
+        // --- End: Check Cache ---
 
-            // Send a response that the frontend can handle as an error (200 status to PHP, success: false in JSON)
-            return res.status(200).json({
-                 success: false,
-                 message: `External analysis service responded with an error (Status ${airdnaResponse.status}). Please try again later.` // User-friendly message
+
+        // --- Conditional Logic: Cache Hit OR API Call ---
+        if (!rawAirDnaResponse) {
+            // --- Cache Miss: Call AirDNA API ---
+            console.log(`🌐 Cache miss. Calling AirDNA API for address ${address}.`);
+
+            // Calculate accommodates/occupancy if not explicitly provided
+            const beds = parseInt(bedrooms, 10) || 0;
+            const calculatedOccupancy = (!occupancy && beds > 0) ? beds * 2 : (parseInt(occupancy, 10) || 0);
+
+            // Prepare parameters for the AirDNA API request URL
+            const params = new URLSearchParams({
+                address: address,
+                ...(beds > 0 && { bedrooms: beds }),
+                ...(parseFloat(bathrooms) > 0 && { bathrooms: parseFloat(bathrooms) }),
+                ...(calculatedOccupancy > 0 && { accommodates: calculatedOccupancy })
             });
-        }
+
+            const airdnaApiUrl = `${process.env.AIRDNA_BASE_URL || 'https://airdna1.p.rapidapi.com/rentalizer'}?${params}`;
+
+            const airdnaResponse = await fetch(airdnaApiUrl, {
+                method: 'GET',
+                headers: {
+                    'x-rapidapi-host': 'airdna1.p.rapidapi.com',
+                    'x-rapidapi-key': process.env.RAPIDAPI_KEY,
+                    //'User-Agent': 'StaySTRAAnalyzer/0.3' // Kept commented out
+                }
+            });
+
+            // Check if the AirDNA API call itself failed (HTTP status 2xx)
+            if (!airdnaResponse.ok) {
+                const errorBody = await airdnaResponse.text();
+                console.error(`AirDNA RapidAPI call failed: Status ${airdnaResponse.status} - ${airdnaResponse.statusText}`, errorBody);
+
+                await sendAlertToN8n({
+                    subject: '🚨 StaySTRA Analyzer External API Error',
+                    body: `AirDNA RapidAPI call failed for address: ${address}\n` +
+                          `• Status: ${airdnaResponse.status} - ${airdnaResponse.statusText}\n` +
+                          `• Response Body: ${errorBody.substring(0, 500)}...\n` +
+                          `• Time: ${new Date().toISOString()}`
+                });
+
+                // --- Log error to database (for AirDNA fetch failures) ---
+                let errorCode = `AIRDNA_FETCH_ERROR_${airdnaResponse.status}`; // More specific code
+                let errorMessage = `AirDNA API call failed. Status: ${airdnaResponse.status}, StatusText: ${airdnaResponse.statusText}, Body: ${errorBody.substring(0, 1000)}`;
+
+                if (queryId !== null) {
+                     try { await pool.query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), queryId]); } catch (logErrorDb) { console.error('🔥🔥 Failed to log AirDNA fetch error:', logErrorDb); }
+                } else {
+                     try { await pool.query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), null]); } catch (logErrorDb) { console.error('🔥🔥 Failed (again) to log AirDNA fetch error (no queryId):', logErrorDb); }
+                }
+                // --- End: Log error to database ---
+
+                // Send a response that the frontend can handle as an error
+                return res.status(200).json({
+                     success: false,
+                     message: `External analysis service responded with an error (Status ${airdnaResponse.status}). Please try again later.`
+                });
+            }
+
+            // Process Raw AirDNA Response if fetch was OK
+            rawAirDnaResponse = await airdnaResponse.json();
+            source = 'api';
+
+            // --- Start: Save to Cache (Only on Cache Miss Success) ---
+            // If we successfully called AirDNA and got a valid JSON response, save it to cache
+            // We will do basic validation of the JSON structure *after* this if block,
+            // so we save the *raw* JSON received if the fetch was successful.
+            try {
+                 await pool.query(
+                     `INSERT INTO property_cache (address, raw_api_response, source_api, last_fetched)
+                      VALUES ($1, $2, $3, NOW())
+                      ON CONFLICT (address) DO UPDATE
+                      SET raw_api_response = EXCLUDED.raw_api_response,
+                          last_fetched = EXCLUDED.last_fetched,
+                          source_api = EXCLUDED.source_api`, // Update if conflict happens (address already exists)
+                     [address, rawAirDnaResponse, 'AirDNA']
+                 );
+                 console.log(`✅ Saved/Updated cache for address ${address}.`);
+            } catch (cacheSaveError) {
+                 console.error('🚫 Failed to save/update cache:', cacheSaveError);
+                 await sendAlertToN8n({
+                    subject: '⚠️ StaySTRA Analyzer Cache Save Error',
+                    body: `Failed to save/update property_cache table for address: ${address || 'N/A'}\n` +
+                          `• Error: ${cacheSaveError.message}\n` +
+                          `• Time: ${new Date().toISOString()}`
+                });
+            }
+            // --- End: Save to Cache ---
+
+        } // --- End Cache Miss: AirDNA Call Block ---
 
 
-        // --- Process Raw AirDNA Response ---
-        // Parse the JSON response from AirDNA
-        const rawAirDnaResponse = await airdnaResponse.json();
-
-        // Console log the raw response only in development environment for debugging if needed
-        if (process.env.NODE_ENV !== 'production') {
-             console.log('📦 Raw AirDNA Response (DEV ONLY):', JSON.stringify(rawAirDnaResponse, null, 2));
-        }
-
+        // --- Process Raw AirDNA Response (from either Cache or API) ---
+        // The rawAirDnaResponse variable now holds the data, whether from cache or a fresh API call.
+        // We process it the same way from this point regardless of source.
 
         // Check if the raw response indicates an error or no data (e.g., RapidAPI subscription message, or no data found)
         // Check the top-level 'data' key exists and is a non-null object
+        // This validation runs for both cache hits and successful API calls
         if (!rawAirDnaResponse || typeof rawAirDnaResponse.data !== 'object' || rawAirDnaResponse.data === null) {
-             console.error('AirDNA returned data in unexpected format or missing main data key:', rawAirDnaResponse); // Keep error log
-             // Attempt to send alert for unexpected data structure
+             console.error('AirDNA data in unexpected format or missing main data key:', rawAirDnaResponse);
              await sendAlertToN8n({
                 subject: '⚠️ StaySTRA Analyzer Unexpected AirDNA Data',
                 body: `AirDNA returned unexpected data structure (missing main data key) for address: ${address}\n` +
-                      `• Raw Response: ${JSON.stringify(rawAirDnaResponse, null, 2).substring(0, 1000)}...\n` + // Limit body length
+                      `• Raw Response: ${JSON.stringify(rawAirDnaResponse, null, 2).substring(0, 1000)}...\n` +
                       `• Time: ${new Date().toISOString()}`
             });
+
+             // --- Log error to database (for unexpected data structure) ---
+             let errorCode = 'AIRDNA_BAD_DATA';
+             let errorMessage = `AirDNA data in unexpected format or missing main data key. Source: ${source}. Raw: ${JSON.stringify(rawAirDnaResponse, null, 2).substring(0, 1000)}`; // Include source
+             if (queryId !== null) {
+                 try { await pool.query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), queryId]); } catch (logErrorDb) { console.error('🔥🔥 Failed to log unexpected data error:', logErrorDb); }
+             } else {
+                 try { await pool.query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), null]); } catch (logErrorDb) { console.error('🔥🔥 Failed (again) to log unexpected data error (no queryId):', logErrorDb); }
+             }
+            // --- End: Log error to database ---
+
              // Send 200 to PHP/frontend with success: false and message
              return res.status(200).json({
                 success: false,
-                message: 'Analysis data format unexpected. Please try a different address or contact support.' // User-friendly message
+                message: 'Analysis data format unexpected. Please try a different address or contact support.'
              });
         }
 
@@ -158,185 +281,159 @@ router.post('/analyze', async (req, res) => {
         const airDnaData = rawAirDnaResponse.data;
 
 
-        // --- START: Validate Structure and Calculate Projected Revenues ---
-        // Check if the main data object has required sub-objects like property_details, property_statistics, combined_market_info
+        // --- Validate Structure and Extract Data ---
+        // Check if the main data object has required sub-objects
+        // This validation also runs for both cache hits and successful API calls
         if (!airDnaData.property_details || !airDnaData.property_statistics || !airDnaData.combined_market_info) {
-             console.error('AirDNA returned data in unexpected format or missing required sub-details (property_details, property_statistics, combined_market_info):', rawAirDnaResponse); // Keep error log
-             // Attempt to send alert for unexpected data structure
+             console.error('AirDNA data missing required sub-details:', rawAirDnaResponse);
              await sendAlertToN8n({
                 subject: '⚠️ StaySTRA Analyzer Unexpected AirDNA Data',
                 body: `AirDNA returned unexpected data structure (missing sub-details) for address: ${address}\n` +
-                      `• Raw Response: ${JSON.stringify(rawAirDnaResponse, null, 2).substring(0, 1000)}...\n` + // Limit body length
+                      `• Raw Response: ${JSON.stringify(rawAirDnaResponse, null, 2).substring(0, 1000)}...\n` +
                       `• Time: ${new Date().toISOString()}`
             });
-             // Send 200 to PHP/frontend with success: false and message
+
+             // --- Log error to database (for missing sub-details) ---
+             let errorCode = 'AIRDNA_MISSING_SUBDATA';
+             let errorMessage = `AirDNA data missing required sub-details. Source: ${source}. Raw: ${JSON.stringify(rawAirDnaResponse, null, 2).substring(0, 1000)}`; // Include source
+             if (queryId !== null) {
+                 try { await pool.query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), queryId]); } catch (logErrorDb) { console.error('🔥🔥 Failed to log missing sub-details error:', logErrorDb); }
+             } else {
+                 try { await pool.query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), null]); } catch (logErrorDb) { console.error('🔥🔥 Failed (again) to log missing sub-details error (no queryId):', logErrorDb); }
+             }
+            // --- End: Log error to database ---
+
              return res.status(200).json({
                 success: false,
-                message: 'No detailed analysis data found for this property or data format unexpected.' // User-friendly message
+                message: 'No detailed analysis data found for this property or data format unexpected.'
              });
         }
-
 
         // Extract necessary data using the correct variable name airDnaData
         const details = airDnaData.property_details || {};
         const stats = airDnaData.property_statistics || {};
-        const comps = airDnaData.comps || []; // comps array is needed for percentile calculation
-        const combinedMarketInfo = airDnaData.combined_market_info || {}; // For market names & scores
-
-        // Ensure we have necessary market stats for calculation
-        // Using optional chaining (?.) for safety if the structure is slightly off
-        const marketRevenueLTM = stats.revenue?.ltm || 0; // For Typical calculation
-        const marketCleaningLTM = stats.cleaning_fee?.ltm || 0; // For all calculations
-        const marketOccupancyLTM = stats.occupancy?.ltm || 0; // For Top 25%/10% calculation (expressed as a decimal, e.g., 0.54)
-
-        // console.log(`📊 Market Stats for Calculation: Revenue LTM=${marketRevenueLTM.toFixed(2)}, Cleaning LTM=${marketCleaningLTM.toFixed(2)}, Occupancy LTM=${(marketOccupancyLTM*100).toFixed(2)}%`); // Removed noisy log
+        const comps = airDnaData.comps || [];
+        const combinedMarketInfo = airDnaData.combined_market_info || {};
 
 
-        // 1. Calculate Average (Typical/50%) Projected Gross Revenue
-        // Formula: property_statistics.revenue.ltm + property_statistics.cleaning_fee.ltm
-        let calculatedRevenueTypical = marketRevenueLTM + marketCleaningLTM;
-        // console.log(`📊 Calculated Revenue Typical (revenue.ltm + cleaning_fee.ltm): ${marketRevenueLTM.toFixed(2)} + ${marketCleaningLTM.toFixed(2)} = ${calculatedRevenueTypical.toFixed(2)}`); // Removed noisy log
-
-
-        // 2. Calculate Top 25% and Top 10% Projected Gross Revenue
-        let calculatedRevenueTop25 = 0;
-        let calculatedRevenueTop10 = 0;
-
-        // Filter comps to only include those with valid ADR > 0 for percentile calculation
-        const compsWithADR = comps.filter(comp => comp.stats?.adr?.ltm > 0);
-        // console.log(`📊 Found ${compsWithADR.length} comps with valid ADR for percentile calculation.`); // Removed noisy log
-
-
-        // Perform top percentile calculation only if there are comps with ADR and market occupancy is positive
-        if (compsWithADR.length > 0 && marketOccupancyLTM > 0) {
-             // Sort comps by ADR descending (highest first)
-             compsWithADR.sort((a, b) => b.stats.adr.ltm - a.stats.adr.ltm);
-
-             // Determine the number of comps for the top 25% and top 10%.
-             // Use Math.ceil to round up, ensuring at least one comp is included if compsWithADR.length > 0.
-             // Use Math.max(1, ...) to ensure we take at least 1 comp if available.
-             const numTop25 = Math.max(1, Math.ceil(compsWithADR.length * 0.25));
-             const numTop10 = Math.max(1, Math.ceil(compsWithADR.length * 0.10));
-
-             // Ensure we don't try to slice more comps than exist (slice handles exceeding array length gracefully, but explicit check is clearer)
-             const actualNumTop25 = Math.min(numTop25, compsWithADR.length);
-             const actualNumTop10 = Math.min(numTop10, compsWithADR.length);
-
-             // Get the top comps arrays
-             const top25Comps = compsWithADR.slice(0, actualNumTop25);
-             const top10Comps = compsWithADR.slice(0, actualNumTop10);
-
-
-             // Calculate average ADR for each subset
-             const avgADRTop25 = top25Comps.length > 0 ? top25Comps.reduce((sum, comp) => sum + comp.stats.adr.ltm, 0) / top25Comps.length : 0;
-             const avgADRTop10 = top10Comps.length > 0 ? top10Comps.reduce((sum, comp) => sum + comp.stats.adr.ltm, 0) / top10Comps.length : 0;
-
-             // console.log(`📊 Avg ADR Top 25% (${top25Comps.length} comps): ${avgADRTop25.toFixed(2)}`); // Removed noisy log
-             // console.log(`📊 Avg ADR Top 10% (${top10Comps.length} comps): ${avgADRTop10.toFixed(2)}`); // Removed noisy log
-
-
-             // Calculate projected revenue for top tiers
-             // Formula: AvgADR * MarketOccupancy * 365 + MarketCleaningFee
-             calculatedRevenueTop25 = (avgADRTop25 * marketOccupancyLTM * 365) + marketCleaningLTM;
-             calculatedRevenueTop10 = (avgADRTop10 * marketOccupancyLTM * 365) + marketCleaningLTM;
-
-             // console.log(`📊 Calculated Revenue Top 25%: (${avgADRTop25.toFixed(2)} * ${(marketOccupancyLTM*100).toFixed(2)}% * 365) + ${marketCleaningLTM.toFixed(2)} = ${calculatedRevenueTop25.toFixed(2)}`); // Removed noisy log
-             // console.log(`📊 Calculated Revenue Top 10%: (${avgADRTop10.toFixed(2)} * ${(marketOccupancyLTM*100).toFixed(2)}% * 365) + ${marketCleaningLTM.toFixed(2)} = ${calculatedRevenueTop10.toFixed(2)}`); // Removed noisy log
-
-        } else {
-             console.warn('⚠️ Not enough comps with ADR or market occupancy is zero to calculate top percentile revenues. Setting Top 25% and Top 10% to 0.'); // Keep this warning
-        }
-
-        // 3. Apply Randomness (+/- 0-1%)
-        // The randomness factor should be between -0.01 and +0.01 (for +/- 1%)
-        // Applies only if the calculated value is > 0.
-        const applyRandomness = (value) => {
-             if (value <= 0) return value; // Don't apply randomness to zero or negative values
-             const randomFactor = (Math.random() * 0.02) - 0.01; // Generates a number between -0.01 and +0.01
-             const result = value * (1 + randomFactor);
-             // console.log(`✨ Applying randomness to ${value.toFixed(2)}. Factor: ${(randomFactor*100).toFixed(2)}%. Result: ${result.toFixed(2)}`); // Removed noisy log
-             return result; // Return as number
-        };
-
-        calculatedRevenueTypical = applyRandomness(calculatedRevenueTypical);
-        calculatedRevenueTop25 = applyRandomness(calculatedRevenueTop25);
-        calculatedRevenueTop10 = applyRandomness(calculatedRevenueTop10);
-
-        console.log(`✅ Final Calculated Projected Revenues: Typical=$${calculatedRevenueTypical.toFixed(2)}, Top25=$${calculatedRevenueTop25.toFixed(2)}, Top10=$${calculatedRevenueTop10.toFixed(2)}`); // Keep this log, shows the final calculated numbers
-
-
-        // --- END: Validate Structure and Calculate Projected Revenues ---
+        // --- Call the calculation function ---
+        // This uses the stats and comps extracted above, regardless of source (cache/API)
+        const calculatedRevenues = calculateRevenues(stats, comps);
+        const { typicalRevenue, top25Revenue, top10Revenue } = calculatedRevenues;
+        // console.log(`✅ Final Calculated Projected Revenues: Typical=$${typicalRevenue.toFixed(2)}, Top25=$${top25Revenue.toFixed(2)}, Top10=$${top10Revenue.toFixed(2)}`);
 
 
         // --- Format Response for Frontend ---
-        // Structure the data to send back to the frontend JavaScript.
-        // This object will be the 'data' property inside the { success: true, data: ... } payload sent to PHP
         const formattedResponse = {
-            // Include the core data extracted from AirDNA that the frontend needs
-            // Accessing these directly from airDnaData aliases
-            property_details: details, // Using the 'details' alias created above
-            property_statistics: stats, // Using the 'stats' alias created above
-            comps: comps, // frontend needs the full comps array for the list display, using the 'comps' alias
-            airdna_market_name: combinedMarketInfo.airdna_market_name, // Using 'combinedMarketInfo' alias
-            airdna_submarket_name: combinedMarketInfo.submarket_name, // Using 'combinedMarketInfo' alias - CORRECTED: submarket_name
-            market_score: combinedMarketInfo.market_score, // Using 'combinedMarketInfo' alias
-            submarket_score: combinedMarketInfo.submarket_score, // Using 'combinedMarketInfo' alias
-
-            // Add calculated simple ARD/Occupancy strings for backward compatibility if needed, or remove if frontend calculates
-            // The frontend currently derives/formats these from property_statistics, so can keep or remove here. Keeping for robustness.
-            ard: stats.adr?.ltm ? `$${stats.adr.ltm.toFixed(0)}` : 'N/A', // Using 'stats' alias
-            occupancy: stats.occupancy?.ltm ? `${(stats.occupancy.ltm * 100).toFixed(0)}%` : 'N/A', // Using 'stats' alias
-
-
-            // === ADD THE CALCULATED REVENUE FIELDS TO THE RESPONSE ===
-            // Ensure these keys match exactly what the frontend analyzer.js expects (projected_revenue_typical, etc.)
-            projected_revenue_typical: calculatedRevenueTypical,
-            projected_revenue_top_25: calculatedRevenueTop25,
-            projected_revenue_top_10: calculatedRevenueTop10,
-            // ==========================================================
+            property_details: details,
+            property_statistics: stats,
+            comps: comps,
+            airdna_market_name: combinedMarketInfo.airdna_market_name,
+            airdna_submarket_name: combinedMarketInfo.submarket_name,
+            market_score: combinedMarketInfo.market_score,
+            submarket_score: combinedMarketInfo.submarket_score,
+            ard: stats.adr?.ltm ? `$${stats.adr.ltm.toFixed(0)}` : 'N/A',
+            occupancy: stats.occupancy?.ltm ? `${(stats.occupancy.ltm * 100).toFixed(0)}%` : 'N/A',
+            projected_revenue_typical: typicalRevenue,
+            projected_revenue_top_25: top25Revenue,
+            projected_revenue_top_10: top10Revenue,
         };
 
-        // console.log('✅ Formatted Response sent to frontend:', formattedResponse); // Removed noisy log
+        // console.log('✅ Formatted Response sent to frontend:', formattedResponse);
+
+
+        // --- Update query log on success ---
+        // This MUST happen BEFORE sending the response.
+        // Only update if we successfully inserted the initial log row
+        if (queryId !== null) {
+            try {
+                // Optionally add a note to the log indicating the source (cache/api)
+                // For now, just mark as success
+                await pool.query(
+                    `UPDATE analyzer_queries
+                     SET query_success = TRUE
+                     WHERE id = $1`,
+                    [queryId]
+                );
+                // console.log(`📊 Updated query log ID ${queryId} to success (Source: ${source}).`);
+            } catch (logUpdateError) {
+                console.error(`🚫 Failed to update query log ID ${queryId} to success:`, logUpdateError);
+                // Optionally send another alert specific to update failure
+            }
+        }
+        // --- End update query log on success ---
 
 
         // --- Send Formatted Response Back to WordPress Backend ---
-        // Your API's successful response should wrap the formatted data
-        // This response structure ({ success: true, data: ... }) is expected by the frontend/PHP proxy
+        // This should be the LAST significant thing that happens in the try block before it closes.
         res.json({
-            success: true, // Indicate success from your API's perspective
-            message: 'Analysis completed', // Optional success message
-            data: formattedResponse // Send the newly formatted data payload
+            success: true,
+            message: `Analysis completed (Source: ${source})`, // Indicate source in message for debugging/testing
+            data: formattedResponse
         });
 
 
-    } catch (error) {
-        // --- Handle Internal API Errors (e.g., network issues before fetch, parsing errors, DB errors if added) ---
-        console.error('📈 Internal Property analysis error:', error); // Keep this error log
+    } // <-- This is the correct closing bracket for the main try block
+    catch (error) {
+        // --- Handle Generic Internal API Errors ---
+        // This catch block handles any errors that weren't specifically caught and handled with a 'return' earlier
+        // (like database errors during initial log/cache save/cache check, parsing errors after initial fetch,
+        // errors during calculations, or errors during the final log update).
+        console.error('📈 Internal Property analysis error:', error);
 
         // Attempt to send alert for internal API failure
         await sendAlertToN8n({
             subject: '🔥 StaySTRA Analyzer Internal API Error',
-            body: `Internal error during analysis for address: ${address || 'N/A'}\n` + // address might be undefined
-                  `• Error: ${error.stack || error.message}\n` + // Include stack trace if available
+            body: `Internal error during analysis for address: ${address || 'N/A'}\n` +
+                  `• Error: ${error.stack || error.message}\n` +
                   `• Time: ${new Date().toISOString()}`
         });
+
+        // --- Start: Log error to database (for generic internal errors) ---
+        let errorCode = 'INTERNAL_ERROR';
+        let errorMessage = error.stack || error.message || 'Unknown error';
+
+        // Attempt to add more context if possible
+        if (error.message) {
+             errorMessage = `Error: ${error.message}`;
+             if (error.stack) {
+                 errorMessage += `\nStack: ${error.stack}`;
+             }
+        }
+        // You could add checks here for specific error types if you need distinct error_codes for them (e.g. DB query error vs calculation error)
+
+        // Use the queryId captured at the start if available
+        if (queryId !== null) {
+            try {
+                await pool.query(
+                    `INSERT INTO query_errors (address, error_code, message, query_id)
+                     VALUES ($1, $2, $3, $4)`,
+                    [address || null, errorCode, errorMessage.substring(0, 4000), queryId] // Limit message length
+                );
+                // console.log(`🚫 Logged internal error to database for address ${address} with code ${errorCode}. Query ID: ${queryId}`);
+            } catch (logErrorDb) {
+                console.error('🔥🔥 Failed to log internal error to query_errors database table:', logErrorDb);
+            }
+        } else {
+             try { await pool.query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address || null, errorCode, errorMessage.substring(0, 4000), null]); } catch (logErrorDb) { console.error('🔥🔥 Failed (again) to log internal error to query_errors database table (no queryId):', logErrorDb); }
+        }
+        // --- End: Log error to database ---
+
 
         // Send a response that the frontend can handle as an error
         // Always send 200 back to admin-ajax.php, let the 'success: false' flag indicate failure
         const statusCode = 200; // Keeping 200 for PHP proxy consistency
 
 
-        // Determine a user-friendly error message
+        // Determine a user-friendly error message for the frontend
         let userMessage = 'An internal error occurred during analysis. Please try again later.';
-         if (process.env.NODE_ENV !== 'production' && error.message) {
-             userMessage += ` (Details: ${error.message})`; // Add details in non-prod logs/alerts, NOT typically in the user message itself
-         }
+        // Keep user message generic unless specific user input validation error
 
         res.status(statusCode).json({
-            success: false, // Indicate failure from your API's perspective
-            message: userMessage, // User-friendly message for the frontend
-            // Optionally include detailed error in non-prod env, but better to rely on logs/alerts
-            // error: process.env.NODE_ENV !== 'production' ? { message: error.message, stack: error.stack } : undefined
+            success: false,
+            message: userMessage,
+            // Provide some limited detail in dev for debugging frontend, but rely on server logs/alerts for sensitive details.
+             errorDetails: process.env.NODE_ENV !== 'production' ? { message: error.message, code: errorCode } : undefined
         });
     }
 });
