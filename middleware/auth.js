@@ -1,4 +1,4 @@
-import pool from '../db.js';
+import { getPool } from '../db.js';
 
 export default async function auth(req, res, next) {
   // Skip auth for health check endpoint

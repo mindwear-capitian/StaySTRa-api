@@ -1,9 +1,10 @@
 // File: /srv/staystra/ss-api/routes/property-analysis.js
-// Description: Handles property analysis requests, calls AirDNA API, calculates projected revenues, and formats response.
+// Description: Handles property analysis requests, calls external analysis API, calculates projected revenues, and formats response.
 
 // Load libraries using ESM syntax
 import express from 'express';
-import pool from '../db.js'; // Assuming db.js is needed for potential future features like rate limiting or history logging
+// --- Change 1: Import getPool function instead of pool directly ---
+import { getPool } from '../db.js';
 import fetch from 'node-fetch'; // Make sure node-fetch is installed (`npm install node-fetch` in ss-api dir)
 // Assuming auth middleware is imported and used in app.js for this router
 
@@ -11,8 +12,6 @@ import fetch from 'node-fetch'; // Make sure node-fetch is installed (`npm insta
 // Corrected path assumes analysisCalculations.js is in ss-api/utils
 import { calculateRevenues } from '../utils/analysisCalculations.js';
 // Note: sendAlertToN8n, vary, coordsAreTooClose could be moved to a separate helpers file later.
-// For now, they remain here as they were in the original code before this refactoring phase.
-
 
 // --- Initialize Express Router ---
 // This MUST be declared AFTER the express import and BEFORE any routes are defined using 'router.post', etc.
@@ -90,7 +89,8 @@ router.post('/analyze', async (req, res) => {
     // Log the query request *before* the main try block to capture it even if analysis fails later.
     let queryId = null; // Variable to hold the ID of the inserted row
     try {
-        const result = await pool.query(
+        // --- Change 2: Use getPool().query instead of pool.query ---
+        const result = await getPool().query(
             `INSERT INTO analyzer_queries (address, referrer, utm_source, agent_id, query_success)
              VALUES ($1, $2, $3, $4, $5)
              RETURNING id`,
@@ -114,7 +114,7 @@ router.post('/analyze', async (req, res) => {
 
 
     // --- Main Processing Logic ---
-    let rawAirDnaResponse = null; // Variable to hold the data, whether from cache or API
+    let rawExternalResponse = null; // Variable to hold the data, whether from cache or API
     let source = 'unknown'; // Track source for potential logging/debugging
 
     try { // This main try block wraps all core logic and catches generic internal errors
@@ -123,7 +123,8 @@ router.post('/analyze', async (req, res) => {
         // --- Start: Check Cache ---
         console.log(`🔍 Checking cache for address ${address}.`); // Keep this log
         try { // Inner try/catch for cache specific errors
-            const cacheResult = await pool.query(
+            // --- Change 3: Use getPool().query instead of pool.query ---
+            const cacheResult = await getPool().query(
                 `SELECT raw_api_response, last_fetched
                  FROM property_cache
                  WHERE address = $1
@@ -132,11 +133,11 @@ router.post('/analyze', async (req, res) => {
             );
 
             if (cacheResult.rows.length > 0) {
-                rawAirDnaResponse = cacheResult.rows[0].raw_api_response;
+                rawExternalResponse = cacheResult.rows[0].raw_api_response;
                 source = 'cache';
-                console.log(`✅ Cache hit for address ${address}. Last fetched: ${cacheResult.rows[0].last_fetched}`); // Keep this log
+                // Cache hit log removed
             } else {
-                console.log(`🔍 No valid cache entry found for address ${address}.`); // Keep this log
+                // No cache entry log removed
             }
 
         } catch (cacheError) {
@@ -147,72 +148,83 @@ router.post('/analyze', async (req, res) => {
                       `• Error: ${cacheError.message}\n` +
                       `• Time: ${new Date().toISOString()}`
             });
-            // Continue execution (rawAirDnaResponse remains null) -> will trigger API call
+            // Continue execution (rawExternalResponse remains null) -> will trigger API call
         }
         // --- End: Check Cache ---
 
 
         // --- Conditional Logic: Cache Hit OR API Call ---
-        if (!rawAirDnaResponse) {
-            // --- Cache Miss: Call AirDNA API ---
-            console.log(`🌐 Cache miss. Calling AirDNA API for address ${address}.`);
+        if (!rawExternalResponse) {
+            // --- Cache Miss: Call External Analysis API ---
+            // Cache miss log removed
 
             // Calculate accommodates/occupancy if not explicitly provided
             const beds = parseInt(bedrooms, 10) || 0;
             const calculatedOccupancy = (!occupancy && beds > 0) ? beds * 2 : (parseInt(occupancy, 10) || 0);
 
             // Prepare parameters for the AirDNA API request URL
-            const params = new URLSearchParams({
+            const params = new URLSearchParams({ // Keep parameters as expected by the external API
                 address: address,
                 ...(beds > 0 && { bedrooms: beds }),
                 ...(parseFloat(bathrooms) > 0 && { bathrooms: parseFloat(bathrooms) }),
                 ...(calculatedOccupancy > 0 && { accommodates: calculatedOccupancy })
             });
 
-            const airdnaApiUrl = `${process.env.AIRDNA_BASE_URL || 'https://airdna1.p.rapidapi.com/rentalizer'}?${params}`;
+            // Use generic environment variables
+            const externalApiBaseUrl = process.env.EXTERNAL_ANALYSIS_BASE_URL;
+            const externalApiKey = process.env.EXTERNAL_ANALYSIS_API_KEY;
+            const externalApiHost = process.env.EXTERNAL_ANALYSIS_API_HOST;
 
-            const airdnaResponse = await fetch(airdnaApiUrl, {
+            if (!externalApiBaseUrl || !externalApiKey || !externalApiHost) {
+                console.error('External API configuration error: Missing required environment variables.');
+                throw new Error('External API service is not configured correctly.'); // Throw internal error
+            }
+
+            const externalApiUrl = `${externalApiBaseUrl}?${params}`;
+
+            const externalApiResponse = await fetch(externalApiUrl, {
                 method: 'GET',
                 headers: {
-                    'x-rapidapi-host': 'airdna1.p.rapidapi.com',
-                    'x-rapidapi-key': process.env.RAPIDAPI_KEY,
-                    //'User-Agent': 'StaySTRAAnalyzer/0.3' // Kept commented out
+                    'x-rapidapi-host': externalApiHost,
+                    'x-rapidapi-key': externalApiKey,
                 }
             });
 
-            // Check if the AirDNA API call itself failed (HTTP status 2xx)
-            if (!airdnaResponse.ok) {
-                const errorBody = await airdnaResponse.text();
-                console.error(`AirDNA RapidAPI call failed: Status ${airdnaResponse.status} - ${airdnaResponse.statusText}`, errorBody);
+            // Check if the external API call itself failed (HTTP status 2xx)
+            if (!externalApiResponse.ok) {
+                const errorBody = await externalApiResponse.text();
+                console.error(`External analysis API call failed: Status ${externalApiResponse.status} - ${externalApiResponse.statusText}`, errorBody);
 
                 await sendAlertToN8n({
                     subject: '🚨 StaySTRA Analyzer External API Error',
-                    body: `AirDNA RapidAPI call failed for address: ${address}\n` +
-                          `• Status: ${airdnaResponse.status} - ${airdnaResponse.statusText}\n` +
+                    body: `External analysis API call failed for address: ${address}\n` +
+                          `• Status: ${externalApiResponse.status} - ${externalApiResponse.statusText}\n` +
                           `• Response Body: ${errorBody.substring(0, 500)}...\n` +
                           `• Time: ${new Date().toISOString()}`
                 });
 
-                // --- Log error to database (for AirDNA fetch failures) ---
-                let errorCode = `AIRDNA_FETCH_ERROR_${airdnaResponse.status}`; // More specific code
-                let errorMessage = `AirDNA API call failed. Status: ${airdnaResponse.status}, StatusText: ${airdnaResponse.statusText}, Body: ${errorBody.substring(0, 1000)}`;
+                // --- Log error to database (for external API fetch failures) ---
+                let errorCode = `EXTERNAL_FETCH_ERROR_${externalApiResponse.status}`; // Generic code
+                let errorMessage = `External API call failed. Status: ${externalApiResponse.status}, StatusText: ${externalApiResponse.statusText}, Body: ${errorBody.substring(0, 1000)}`;
 
                 if (queryId !== null) {
-                     try { await pool.query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), queryId]); } catch (logErrorDb) { console.error('🔥🔥 Failed to log AirDNA fetch error:', logErrorDb); }
+                     // --- Change 4: Use getPool().query instead of pool.query ---
+                     try { await getPool().query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), queryId]); } catch (logErrorDb) { console.error('🔥🔥 Failed to log AirDNA fetch error:', logErrorDb); }
                 } else {
-                     try { await pool.query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), null]); } catch (logErrorDb) { console.error('🔥🔥 Failed (again) to log AirDNA fetch error (no queryId):', logErrorDb); }
+                     // --- Change 5: Use getPool().query instead of pool.query ---
+                     try { await getPool().query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), null]); } catch (logErrorDb) { console.error('🔥🔥 Failed (again) to log AirDNA fetch error (no queryId):', logErrorDb); }
                 }
                 // --- End: Log error to database ---
 
                 // Send a response that the frontend can handle as an error
                 return res.status(200).json({
                      success: false,
-                     message: `External analysis service responded with an error (Status ${airdnaResponse.status}). Please try again later.`
+                     message: `External analysis service responded with an error (Status ${externalApiResponse.status}). Please try again later.`
                 });
             }
 
-            // Process Raw AirDNA Response if fetch was OK
-            rawAirDnaResponse = await airdnaResponse.json();
+            // Process Raw External Response if fetch was OK
+            rawExternalResponse = await externalApiResponse.json();
             source = 'api';
 
             // --- Start: Save to Cache (Only on Cache Miss Success) ---
@@ -220,16 +232,17 @@ router.post('/analyze', async (req, res) => {
             // We will do basic validation of the JSON structure *after* this if block,
             // so we save the *raw* JSON received if the fetch was successful.
             try {
-                 await pool.query(
+                 // --- Change 6: Use getPool().query instead of pool.query ---
+                 await getPool().query(
                      `INSERT INTO property_cache (address, raw_api_response, source_api, last_fetched)
                       VALUES ($1, $2, $3, NOW())
                       ON CONFLICT (address) DO UPDATE
                       SET raw_api_response = EXCLUDED.raw_api_response,
                           last_fetched = EXCLUDED.last_fetched,
                           source_api = EXCLUDED.source_api`, // Update if conflict happens (address already exists)
-                     [address, rawAirDnaResponse, 'AirDNA']
+                     [address, rawExternalResponse, 'External'] // Use generic source name
                  );
-                 console.log(`✅ Saved/Updated cache for address ${address}.`);
+                 // Cache save/update log removed
             } catch (cacheSaveError) {
                  console.error('🚫 Failed to save/update cache:', cacheSaveError);
                  await sendAlertToN8n({
@@ -241,32 +254,34 @@ router.post('/analyze', async (req, res) => {
             }
             // --- End: Save to Cache ---
 
-        } // --- End Cache Miss: AirDNA Call Block ---
+        } // --- End Cache Miss: External API Call Block ---
 
 
-        // --- Process Raw AirDNA Response (from either Cache or API) ---
-        // The rawAirDnaResponse variable now holds the data, whether from cache or a fresh API call.
+        // --- Process Raw External Response (from either Cache or API) ---
+        // The rawExternalResponse variable now holds the data, whether from cache or a fresh API call.
         // We process it the same way from this point regardless of source.
 
         // Check if the raw response indicates an error or no data (e.g., RapidAPI subscription message, or no data found)
         // Check the top-level 'data' key exists and is a non-null object
         // This validation runs for both cache hits and successful API calls
-        if (!rawAirDnaResponse || typeof rawAirDnaResponse.data !== 'object' || rawAirDnaResponse.data === null) {
-             console.error('AirDNA data in unexpected format or missing main data key:', rawAirDnaResponse);
+        if (!rawExternalResponse || typeof rawExternalResponse.data !== 'object' || rawExternalResponse.data === null) {
+             console.error('External analysis data in unexpected format or missing main data key:', rawExternalResponse);
              await sendAlertToN8n({
-                subject: '⚠️ StaySTRA Analyzer Unexpected AirDNA Data',
-                body: `AirDNA returned unexpected data structure (missing main data key) for address: ${address}\n` +
-                      `• Raw Response: ${JSON.stringify(rawAirDnaResponse, null, 2).substring(0, 1000)}...\n` +
+                subject: '⚠️ StaySTRA Analyzer Unexpected External Data',
+                body: `External service returned unexpected data structure (missing main data key) for address: ${address}\n` +
+                      `• Raw Response: ${JSON.stringify(rawExternalResponse, null, 2).substring(0, 1000)}...\n` +
                       `• Time: ${new Date().toISOString()}`
             });
 
-             // --- Log error to database (for unexpected data structure) ---
-             let errorCode = 'AIRDNA_BAD_DATA';
-             let errorMessage = `AirDNA data in unexpected format or missing main data key. Source: ${source}. Raw: ${JSON.stringify(rawAirDnaResponse, null, 2).substring(0, 1000)}`; // Include source
+             // --- Log error to database (for unexpected external data structure) ---
+             let errorCode = 'EXTERNAL_BAD_DATA'; // Generic code
+             let errorMessage = `External data in unexpected format or missing main data key. Source: ${source}. Raw: ${JSON.stringify(rawExternalResponse, null, 2).substring(0, 1000)}`; // Include source
              if (queryId !== null) {
-                 try { await pool.query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), queryId]); } catch (logErrorDb) { console.error('🔥🔥 Failed to log unexpected data error:', logErrorDb); }
+                 // --- Change 7: Use getPool().query instead of pool.query ---
+                 try { await getPool().query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), queryId]); } catch (logErrorDb) { console.error('🔥🔥 Failed to log unexpected data error:', logErrorDb); }
              } else {
-                 try { await pool.query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), null]); } catch (logErrorDb) { console.error('🔥🔥 Failed (again) to log unexpected data error (no queryId):', logErrorDb); }
+                 // --- Change 8: Use getPool().query instead of pool.query ---
+                 try { await getPool().query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), null]); } catch (logErrorDb) { console.error('🔥🔥 Failed (again) to log unexpected data error (no queryId):', logErrorDb); }
              }
             // --- End: Log error to database ---
 
@@ -277,29 +292,31 @@ router.post('/analyze', async (req, res) => {
              });
         }
 
-        // AirDNA returns the actual data nested under a 'data' key
-        const airDnaData = rawAirDnaResponse.data;
+        // Assume the external service returns the actual data nested under a 'data' key
+        const externalData = rawExternalResponse.data;
 
 
         // --- Validate Structure and Extract Data ---
         // Check if the main data object has required sub-objects
         // This validation also runs for both cache hits and successful API calls
-        if (!airDnaData.property_details || !airDnaData.property_statistics || !airDnaData.combined_market_info) {
-             console.error('AirDNA data missing required sub-details:', rawAirDnaResponse);
+        if (!externalData.property_details || !externalData.property_statistics || !externalData.combined_market_info) {
+             console.error('External analysis data missing required sub-details:', rawExternalResponse);
              await sendAlertToN8n({
-                subject: '⚠️ StaySTRA Analyzer Unexpected AirDNA Data',
-                body: `AirDNA returned unexpected data structure (missing sub-details) for address: ${address}\n` +
-                      `• Raw Response: ${JSON.stringify(rawAirDnaResponse, null, 2).substring(0, 1000)}...\n` +
+                subject: '⚠️ StaySTRA Analyzer Unexpected External Data',
+                body: `External service returned unexpected data structure (missing sub-details) for address: ${address}\n` +
+                      `• Raw Response: ${JSON.stringify(rawExternalResponse, null, 2).substring(0, 1000)}...\n` +
                       `• Time: ${new Date().toISOString()}`
             });
 
-             // --- Log error to database (for missing sub-details) ---
-             let errorCode = 'AIRDNA_MISSING_SUBDATA';
-             let errorMessage = `AirDNA data missing required sub-details. Source: ${source}. Raw: ${JSON.stringify(rawAirDnaResponse, null, 2).substring(0, 1000)}`; // Include source
+             // --- Log error to database (for missing external sub-details) ---
+             let errorCode = 'EXTERNAL_MISSING_SUBDATA'; // Generic code
+             let errorMessage = `External data missing required sub-details. Source: ${source}. Raw: ${JSON.stringify(rawExternalResponse, null, 2).substring(0, 1000)}`; // Include source
              if (queryId !== null) {
-                 try { await pool.query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), queryId]); } catch (logErrorDb) { console.error('🔥🔥 Failed to log missing sub-details error:', logErrorDb); }
+                 // --- Change 9: Use getPool().query instead of pool.query ---
+                 try { await getPool().query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), queryId]); } catch (logErrorDb) { console.error('🔥🔥 Failed to log missing sub-details error:', logErrorDb); }
              } else {
-                 try { await pool.query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), null]); } catch (logErrorDb) { console.error('🔥🔥 Failed (again) to log missing sub-details error (no queryId):', logErrorDb); }
+                 // --- Change 10: Use getPool().query instead of pool.query ---
+                 try { await getPool().query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address, errorCode, errorMessage.substring(0, 4000), null]); } catch (logErrorDb) { console.error('🔥🔥 Failed (again) to log missing sub-details error (no queryId):', logErrorDb); }
              }
             // --- End: Log error to database ---
 
@@ -309,11 +326,11 @@ router.post('/analyze', async (req, res) => {
              });
         }
 
-        // Extract necessary data using the correct variable name airDnaData
-        const details = airDnaData.property_details || {};
-        const stats = airDnaData.property_statistics || {};
-        const comps = airDnaData.comps || [];
-        const combinedMarketInfo = airDnaData.combined_market_info || {};
+        // Extract necessary data using the correct variable name externalData
+        const details = externalData.property_details || {};
+        const stats = externalData.property_statistics || {};
+        const comps = externalData.comps || [];
+        const combinedMarketInfo = externalData.combined_market_info || {};
 
 
         // --- Call the calculation function ---
@@ -328,15 +345,15 @@ router.post('/analyze', async (req, res) => {
             property_details: details,
             property_statistics: stats,
             comps: comps,
-            airdna_market_name: combinedMarketInfo.airdna_market_name,
-            airdna_submarket_name: combinedMarketInfo.submarket_name,
+            StaySTRa_market_name: combinedMarketInfo.airdna_market_name,
+            StaySTRa_submarket_name: combinedMarketInfo.submarket_name,
             market_score: combinedMarketInfo.market_score,
             submarket_score: combinedMarketInfo.submarket_score,
             ard: stats.adr?.ltm ? `$${stats.adr.ltm.toFixed(0)}` : 'N/A',
             occupancy: stats.occupancy?.ltm ? `${(stats.occupancy.ltm * 100).toFixed(0)}%` : 'N/A',
-            projected_revenue_typical: typicalRevenue,
-            projected_revenue_top_25: top25Revenue,
-            projected_revenue_top_10: top10Revenue,
+            projected_revenue_typical: vary(typicalRevenue), // Apply randomization
+            projected_revenue_top_25: vary(top25Revenue),   // Apply randomization
+            projected_revenue_top_10: vary(top10Revenue),   // Apply randomization
         };
 
         // console.log('✅ Formatted Response sent to frontend:', formattedResponse);
@@ -349,13 +366,14 @@ router.post('/analyze', async (req, res) => {
             try {
                 // Optionally add a note to the log indicating the source (cache/api)
                 // For now, just mark as success
-                await pool.query(
+                // --- Change 11: Use getPool().query instead of pool.query ---
+                await getPool().query(
                     `UPDATE analyzer_queries
                      SET query_success = TRUE
                      WHERE id = $1`,
                     [queryId]
                 );
-                // console.log(`📊 Updated query log ID ${queryId} to success (Source: ${source}).`);
+                    // Query log update success log removed
             } catch (logUpdateError) {
                 console.error(`🚫 Failed to update query log ID ${queryId} to success:`, logUpdateError);
                 // Optionally send another alert specific to update failure
@@ -405,17 +423,19 @@ router.post('/analyze', async (req, res) => {
         // Use the queryId captured at the start if available
         if (queryId !== null) {
             try {
-                await pool.query(
+                // --- Change 12: Use getPool().query instead of pool.query ---
+                await getPool().query(
                     `INSERT INTO query_errors (address, error_code, message, query_id)
                      VALUES ($1, $2, $3, $4)`,
                     [address || null, errorCode, errorMessage.substring(0, 4000), queryId] // Limit message length
                 );
-                // console.log(`🚫 Logged internal error to database for address ${address} with code ${errorCode}. Query ID: ${queryId}`);
+                    // Internal error log success message removed
             } catch (logErrorDb) {
                 console.error('🔥🔥 Failed to log internal error to query_errors database table:', logErrorDb);
             }
         } else {
-             try { await pool.query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address || null, errorCode, errorMessage.substring(0, 4000), null]); } catch (logErrorDb) { console.error('🔥🔥 Failed (again) to log internal error to query_errors database table (no queryId):', logErrorDb); }
+             // --- Change 13: Use getPool().query instead of pool.query ---
+             try { await getPool().query(`INSERT INTO query_errors (address, error_code, message, query_id) VALUES ($1, $2, $3, $4)`, [address || null, errorCode, errorMessage.substring(0, 4000), null]); } catch (logErrorDb) { console.error('🔥🔥 Failed (again) to log internal error to query_errors database table (no queryId):', logErrorDb); }
         }
         // --- End: Log error to database ---
 
