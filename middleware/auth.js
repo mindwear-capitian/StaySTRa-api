@@ -15,7 +15,8 @@ const key = req.headers['x-api-key']; // <-- CORRECTED: Read key from 'x-api-key
   }
 
   try {
-    const result = await pool.query(
+    // --- Change: Use getPool() to get the pool instance ---
+    const result = await getPool().query(
       'SELECT id FROM ss_api_keys WHERE key = $1',
       [key]
     );

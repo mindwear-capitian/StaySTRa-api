@@ -1,0 +1,25 @@
+# Ignore git repository - CRITICAL for security and image size
+.git
+
+# Ignore local environment file (should be injected at runtime) - CRITICAL for security
+.env
+
+# Ignore node_modules (they are installed within the container during the build)
+node_modules
+
+# Ignore log files and temporary files
+*.log
+temp/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Ignore OS generated files
+.DS_Store
+Thumbs.db
+
+# Ignore IDE/Editor specific files (optional, but good practice)
+.vscode
+.idea
+

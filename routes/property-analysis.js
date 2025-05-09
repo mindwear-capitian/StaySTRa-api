@@ -162,6 +162,22 @@ router.post('/analyze', async (req, res) => {
             const beds = parseInt(bedrooms, 10) || 0;
             const calculatedOccupancy = (!occupancy && beds > 0) ? beds * 2 : (parseInt(occupancy, 10) || 0);
 
+            // --- START: MODIFICATION TO FORMAT ADDRESS ---
+            let apiFormattedAddress = address; // Start with the original address from req.body
+
+            // Check if address exists and doesn't already contain a comma
+            if (address && typeof address === 'string' && !address.includes(',')) {
+                const words = address.trim().split(' ');
+                if (words.length > 1) { // We need at least two words (e.g., "street city")
+                    const potentialCity = words.pop(); // Takes the last word
+                    const streetPart = words.join(' ');
+                    apiFormattedAddress = `${streetPart}, ${potentialCity}`;
+                    console.log(`[StaySTRA API INFO] Address Formatting: Original: "${address}", Formatted for AirDNA: "${apiFormattedAddress}"`);
+                }
+            }
+            // --- END: MODIFICATION TO FORMAT ADDRESS ---
+
+
             // Prepare parameters for the AirDNA API request URL
             const params = new URLSearchParams({ // Keep parameters as expected by the external API
                 address: address,
@@ -181,6 +197,13 @@ router.post('/analyze', async (req, res) => {
             }
 
             const externalApiUrl = `${externalApiBaseUrl}?${params}`;
+
+            // ADD THESE CONSOLE.LOGS:
+            console.log('[DEBUG] Making external API call with the following details:');
+            console.log(`[DEBUG]   URL: ${externalApiUrl}`);
+            console.log(`[DEBUG]   Host Header: ${externalApiHost}`);
+            console.log(`[DEBUG]   API Key (last 5 chars): ${externalApiKey ? externalApiKey.slice(-5) : 'NOT SET'}`); // Log only last few chars of key
+            // end Logs
 
             const externalApiResponse = await fetch(externalApiUrl, {
                 method: 'GET',
@@ -384,12 +407,16 @@ router.post('/analyze', async (req, res) => {
 
         // --- Send Formatted Response Back to WordPress Backend ---
         // This should be the LAST significant thing that happens in the try block before it closes.
+        // --- CORRECTED LOG PLACEMENT ---
+        console.log('--- DEBUG: Final formattedResponse object being sent ---');
+        console.log(JSON.stringify(formattedResponse, null, 2));
+        // --- END CORRECTED LOG PLACEMENT ---
+
         res.json({
             success: true,
             message: `Analysis completed (Source: ${source})`, // Indicate source in message for debugging/testing
             data: formattedResponse
         });
-
 
     } // <-- This is the correct closing bracket for the main try block
     catch (error) {
