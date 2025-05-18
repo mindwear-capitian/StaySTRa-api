@@ -288,7 +288,7 @@ router.post('/analyze', async (req, res) => {
         // Check the top-level 'data' key exists and is a non-null object
         // This validation runs for both cache hits and successful API calls
         if (!rawExternalResponse || typeof rawExternalResponse.data !== 'object' || rawExternalResponse.data === null) {
-             console.error('External analysis data in unexpected format or missing main data key:', rawExternalResponse);
+             //console.error('External analysis data in unexpected format or missing main data key:', rawExternalResponse);// Temp silence
              await sendAlertToN8n({
                 subject: '⚠️ StaySTRA Analyzer Unexpected External Data',
                 body: `External service returned unexpected data structure (missing main data key) for address: ${address}\n` +
@@ -323,7 +323,7 @@ router.post('/analyze', async (req, res) => {
         // Check if the main data object has required sub-objects
         // This validation also runs for both cache hits and successful API calls
         if (!externalData.property_details || !externalData.property_statistics || !externalData.combined_market_info) {
-             console.error('External analysis data missing required sub-details:', rawExternalResponse);
+             //console.error('External analysis data missing required sub-details:', rawExternalResponse);// Temp silence
              await sendAlertToN8n({
                 subject: '⚠️ StaySTRA Analyzer Unexpected External Data',
                 body: `External service returned unexpected data structure (missing sub-details) for address: ${address}\n` +
@@ -407,10 +407,9 @@ router.post('/analyze', async (req, res) => {
 
         // --- Send Formatted Response Back to WordPress Backend ---
         // This should be the LAST significant thing that happens in the try block before it closes.
-        // --- CORRECTED LOG PLACEMENT ---
-        console.log('--- DEBUG: Final formattedResponse object being sent ---');
-        console.log(JSON.stringify(formattedResponse, null, 2));
-        // --- END CORRECTED LOG PLACEMENT ---
+        // console.log('--- DEBUG: Final formattedResponse object being sent ---');
+        // console.log(JSON.stringify(formattedResponse, null, 2));
+       
 
         res.json({
             success: true,
