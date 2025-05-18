@@ -255,6 +255,7 @@ router.post('/analyze', async (req, res) => {
             // We will do basic validation of the JSON structure *after* this if block,
             // so we save the *raw* JSON received if the fetch was successful.
             try {
+                console.log(`[CACHE WRITE ATTEMPT] For address: "${address}"`);
                  // --- Change 6: Use getPool().query instead of pool.query ---
                  await getPool().query(
                      `INSERT INTO property_cache (address, raw_api_response, source_api, last_fetched)
@@ -265,9 +266,10 @@ router.post('/analyze', async (req, res) => {
                           source_api = EXCLUDED.source_api`, // Update if conflict happens (address already exists)
                      [address, rawExternalResponse, 'External'] // Use generic source name
                  );
+                 console.log(`[CACHE WRITE SUCCESS] For address: "${address}"`);
                  // Cache save/update log removed
             } catch (cacheSaveError) {
-                 console.error('🚫 Failed to save/update cache:', cacheSaveError);
+                 console.error(`[CACHE WRITE FAILED] For address: "${address}"`, cacheSaveError);
                  await sendAlertToN8n({
                     subject: '⚠️ StaySTRA Analyzer Cache Save Error',
                     body: `Failed to save/update property_cache table for address: ${address || 'N/A'}\n` +
