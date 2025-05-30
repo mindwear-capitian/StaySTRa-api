@@ -120,37 +120,38 @@ router.post('/analyze', async (req, res) => {
     try { // This main try block wraps all core logic and catches generic internal errors
         const cacheExpirationDays = 30; // Define how old a cache entry can be
 
-        // --- Start: Check Cache ---
-        console.log(`🔍 Checking cache for address ${address}.`); // Keep this log
-        try { // Inner try/catch for cache specific errors
-            // --- Change 3: Use getPool().query instead of pool.query ---
+           // --- Start: Check Cache ---
+        console.log(`🔍 Checking cache for address ${address}.`); // This is an original useful log
+        try {
             const cacheResult = await getPool().query(
                 `SELECT raw_api_response, last_fetched
                  FROM property_cache
                  WHERE address = $1
-                 AND last_fetched >= NOW() - INTERVAL '${cacheExpirationDays} days'`, // Check expiration
+                 AND last_fetched >= NOW() - INTERVAL '${cacheExpirationDays} days'`,
                 [address]
             );
 
             if (cacheResult.rows.length > 0) {
                 rawExternalResponse = cacheResult.rows[0].raw_api_response;
                 source = 'cache';
-                // Cache hit log removed
             } else {
-                // No cache entry log removed
+                source = 'api'; // Explicitly set for clarity if a cache miss
             }
 
         } catch (cacheError) {
-            console.error('🚫 Failed during cache check:', cacheError);
+            console.error('🚫 Failed during cache check:', cacheError); // This is an original useful error log
             await sendAlertToN8n({
                 subject: '⚠️ StaySTRA Analyzer Cache Check Error',
                 body: `Failed to check property_cache table for address: ${address || 'N/A'}\n` +
                       `• Error: ${cacheError.message}\n` +
                       `• Time: ${new Date().toISOString()}`
             });
-            // Continue execution (rawExternalResponse remains null) -> will trigger API call
+            // rawExternalResponse remains null, which will trigger an API call attempt
+            source = 'api_due_to_cache_error'; // Explicitly set for clarity
         }
         // --- End: Check Cache ---
+
+    console.log(`[V2_LOG] After cache check. RawExternalResponse is ${rawExternalResponse ? 'POPULATED' : 'NULL'}. Source: ${source}`); // New log
 
 
         // --- Conditional Logic: Cache Hit OR API Call ---
